@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+outputs/
+logs/
+*.log
+
+# Keep model directories in Git, but store large weights with Git LFS.
+models/**/cache/
+models/**/.cache/
+

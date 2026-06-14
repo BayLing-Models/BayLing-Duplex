@@ -1,0 +1,8 @@
+cff-version: 1.2.0
+title: "BayLing-Duplex: Native Full-Duplex Speech Dialogue with a Single Autoregressive LLM"
+message: "If you use this model or code, please cite the paper."
+type: software
+authors:
+  - name: "BayLing-Duplex Team"
+year: 2026
+license: "other"

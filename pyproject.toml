@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bayling-duplex"
+version = "0.1.0"
+description = "Native full-duplex speech dialogue inference for BayLing-Duplex."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "See LICENSE" }
+dependencies = [
+  "torch>=2.1",
+  "torchaudio>=2.1",
+  "transformers>=4.45",
+  "safetensors",
+  "sentencepiece",
+  "numpy",
+  "scipy",
+  "einops",
+  "omegaconf",
+  "hyperpyyaml",
+  "diffusers",
+  "conformer",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["bayling_duplex*", "bayling_duplex_runtime*"]
+
+[tool.setuptools.package-data]
+bayling_duplex_runtime = ["third_party/Matcha-TTS/matcha/**/*.py"]
