@@ -6,8 +6,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+import numpy as np
 import torch
-import torchaudio
+import soundfile as sf
+from scipy.signal import resample_poly
 from transformers import AutoModel, AutoTokenizer, WhisperFeatureExtractor
 
 
@@ -101,6 +103,32 @@ class DuplexResult:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", encoding="utf-8") as f:
             json.dump(self.to_dict(include_tokens=include_tokens), f, indent=2, ensure_ascii=False)
+
+
+@dataclass
+class DuplexStreamEvent:
+    kind: str
+    block_index: int
+    token_id: Optional[int] = None
+    text: Optional[str] = None
+    audio_tokens: List[int] = field(default_factory=list)
+    assistant_started: bool = False
+    assistant_finished: bool = False
+    stop_requested: bool = False
+
+
+@dataclass
+class DuplexStreamState:
+    text_tokens: List[int] = field(default_factory=list)
+    audio_tokens: List[int] = field(default_factory=list)
+    user_audio_tokens: List[int] = field(default_factory=list)
+    past_key_values: Any = None
+    current_position: int = 0
+    assistant_count: int = 0
+    epad_count: int = 0
+    block_index: int = 0
+    completed_blocks: int = 0
+    stop_requested: bool = False
 
 
 def _patch_model_for_new_transformers(model: torch.nn.Module) -> None:
@@ -212,7 +240,10 @@ class BayLingDuplex:
         return x_ratio, y_ratio, z_ratio
 
     def _optional_token_id(self, token: str) -> Optional[int]:
-        token_id = self.tokenizer.convert_tokens_to_ids(token)
+        try:
+            token_id = self.tokenizer.convert_tokens_to_ids(token)
+        except KeyError:
+            return None
         unk_id = getattr(self.tokenizer, "unk_token_id", None)
         if token_id is None or (unk_id is not None and token_id == unk_id and token != self.tokenizer.unk_token):
             return None
@@ -224,8 +255,23 @@ class BayLingDuplex:
             raise ValueError(f"Required token is missing from tokenizer: {token}")
         return token_id
 
+    def _resolve_audio_vocab_size(self) -> int:
+        for audio_idx in range(self.audio_vocab_size - 1, -1, -1):
+            token_id = self._optional_token_id(f"<|audio_{audio_idx}|>")
+            if token_id is None:
+                continue
+            expected_id = self.audio_token_start + audio_idx
+            if token_id != expected_id:
+                raise ValueError(
+                    f"Audio tokens are expected to be contiguous, but <|audio_{audio_idx}|> "
+                    f"has id {token_id}, expected {expected_id}."
+                )
+            return audio_idx + 1
+        raise ValueError("No audio tokens were found in the tokenizer.")
+
     def _cache_special_tokens(self) -> None:
         self.audio_token_start = self._required_token_id("<|audio_0|>")
+        self.audio_vocab_size = self._resolve_audio_vocab_size()
         self.audio_token_end = self.audio_token_start + self.audio_vocab_size
         self.end_token_id = self._optional_token_id("<|endoftext|>")
         self.user_token_id = self._optional_token_id("<|user|>")
@@ -252,15 +298,20 @@ class BayLingDuplex:
         elif isinstance(audio, torch.Tensor):
             waveform, sample_rate = audio, self.sample_rate
         else:
-            waveform, sample_rate = torchaudio.load(str(audio))
+            data, sample_rate = sf.read(str(audio), always_2d=True, dtype="float32")
+            waveform = torch.from_numpy(data.T.copy())
 
         if waveform.dim() == 1:
             waveform = waveform.unsqueeze(0)
         if waveform.shape[0] > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
         if sample_rate != self.sample_rate:
-            resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=self.sample_rate)
-            waveform = resampler(waveform)
+            waveform_np = waveform.detach().cpu().numpy()
+            gcd = np.gcd(int(sample_rate), int(self.sample_rate))
+            up = self.sample_rate // gcd
+            down = int(sample_rate) // gcd
+            resampled = resample_poly(waveform_np, up, down, axis=1).astype(np.float32, copy=False)
+            waveform = torch.from_numpy(resampled)
 
         duration = waveform.shape[1] / self.sample_rate
         return waveform.contiguous(), duration
@@ -364,13 +415,141 @@ class BayLingDuplex:
             return False
         return assistant_count <= epad_count
 
+    def _decode_one_text_token(self, token_id: int) -> str:
+        if token_id in self._text_special_token_ids:
+            return ""
+        return self.tokenizer.decode([token_id], skip_special_tokens=False)
+
+    def create_stream_state(self) -> DuplexStreamState:
+        return DuplexStreamState()
+
+    @torch.no_grad()
+    def stream_audio_tokens(
+        self,
+        user_audio_tokens: Sequence[int],
+        state: Optional[DuplexStreamState] = None,
+        temperature: float = 0.8,
+        top_p: float = 0.8,
+        silence_penalty: float = 0.0,
+        max_epad_count: int = 1,
+    ):
+        if state is None:
+            state = self.create_stream_state()
+        if state.stop_requested:
+            return
+
+        num_tokens = (len(user_audio_tokens) // self.x_ratio) * self.x_ratio
+        user_audio_tokens = list(user_audio_tokens[:num_tokens])
+        user_token_ids = [token + self.audio_token_start for token in user_audio_tokens]
+
+        for start in range(0, len(user_token_ids), self.x_ratio):
+            block_user_tokens = user_token_ids[start : start + self.x_ratio]
+            if len(block_user_tokens) < self.x_ratio:
+                break
+
+            state.user_audio_tokens.extend(token - self.audio_token_start for token in block_user_tokens)
+            current_input = torch.tensor([block_user_tokens], device=self.device)
+            position_ids = torch.arange(
+                state.current_position,
+                state.current_position + len(block_user_tokens),
+                device=self.device,
+            ).unsqueeze(0)
+            outputs = self.model(
+                input_ids=current_input,
+                position_ids=position_ids,
+                past_key_values=state.past_key_values,
+                use_cache=True,
+            )
+            state.past_key_values = outputs.past_key_values
+            logits = outputs.logits[:, -1, :]
+            state.current_position += len(block_user_tokens)
+
+            for _ in range(self.y_ratio):
+                apply_penalty = self._should_apply_silence_penalty(
+                    state.assistant_count,
+                    state.epad_count,
+                    max_epad_count,
+                )
+                token_id = self._sample_token(
+                    logits,
+                    temperature=temperature,
+                    top_p=top_p,
+                    mode="text",
+                    silence_penalty=silence_penalty if apply_penalty else 0.0,
+                )
+                state.text_tokens.append(token_id)
+
+                assistant_started = token_id == self.assistant_token_id
+                assistant_finished = token_id == self.epad_token_id
+                if assistant_started:
+                    state.assistant_count += 1
+                elif assistant_finished:
+                    state.epad_count += 1
+                    if state.epad_count >= max_epad_count:
+                        state.stop_requested = True
+                elif self.end_token_id is not None and token_id == self.end_token_id:
+                    state.stop_requested = True
+
+                yield DuplexStreamEvent(
+                    kind="text",
+                    block_index=state.block_index,
+                    token_id=token_id,
+                    text=self._decode_one_text_token(token_id),
+                    assistant_started=assistant_started,
+                    assistant_finished=assistant_finished,
+                    stop_requested=state.stop_requested,
+                )
+
+                current_input = torch.tensor([[token_id]], device=self.device)
+                position_ids = torch.tensor([[state.current_position]], device=self.device)
+                outputs = self.model(
+                    input_ids=current_input,
+                    position_ids=position_ids,
+                    past_key_values=state.past_key_values,
+                    use_cache=True,
+                )
+                state.past_key_values = outputs.past_key_values
+                logits = outputs.logits[:, -1, :]
+                state.current_position += 1
+
+            block_audio_tokens: List[int] = []
+            for _ in range(self.z_ratio):
+                token_id = self._sample_token(logits, temperature=temperature, top_p=top_p, mode="audio")
+                audio_token = token_id - self.audio_token_start
+                state.audio_tokens.append(audio_token)
+                block_audio_tokens.append(audio_token)
+
+                current_input = torch.tensor([[token_id]], device=self.device)
+                position_ids = torch.tensor([[state.current_position]], device=self.device)
+                outputs = self.model(
+                    input_ids=current_input,
+                    position_ids=position_ids,
+                    past_key_values=state.past_key_values,
+                    use_cache=True,
+                )
+                state.past_key_values = outputs.past_key_values
+                logits = outputs.logits[:, -1, :]
+                state.current_position += 1
+
+            yield DuplexStreamEvent(
+                kind="audio",
+                block_index=state.block_index,
+                audio_tokens=block_audio_tokens,
+                stop_requested=state.stop_requested,
+            )
+
+            state.block_index += 1
+            state.completed_blocks += 1
+            if state.stop_requested:
+                break
+
     @torch.no_grad()
     def generate_from_audio_tokens(
         self,
         user_audio_tokens: Sequence[int],
         user_audio_duration: Optional[float],
         max_duration: float = 60.0,
-        temperature: float = 0.6,
+        temperature: float = 0.8,
         top_p: float = 0.8,
         silence_penalty: float = 0.0,
         max_epad_count: int = 1,
@@ -381,104 +560,35 @@ class BayLingDuplex:
         num_available_blocks = num_tokens // self.x_ratio
         block_count = min(num_available_blocks, max_blocks)
 
-        user_token_ids = [token + self.audio_token_start for token in user_audio_tokens]
-        text_tokens: List[int] = []
-        audio_tokens: List[int] = []
-        past_key_values = None
-        current_position = 0
-        assistant_count = 0
-        epad_count = 0
-        stop_after_block = False
-        block_idx = -1
+        state = self.create_stream_state()
+        for _ in self.stream_audio_tokens(
+            user_audio_tokens[: block_count * self.x_ratio],
+            state=state,
+            temperature=temperature,
+            top_p=top_p,
+            silence_penalty=silence_penalty,
+            max_epad_count=max_epad_count,
+        ):
+            pass
 
-        for block_idx in range(block_count):
-            start = block_idx * self.x_ratio
-            block_user_tokens = user_token_ids[start : start + self.x_ratio]
-            current_input = torch.tensor([block_user_tokens], device=self.device)
-            position_ids = torch.arange(
-                current_position,
-                current_position + len(block_user_tokens),
-                device=self.device,
-            ).unsqueeze(0)
-            outputs = self.model(
-                input_ids=current_input,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=True,
-            )
-            past_key_values = outputs.past_key_values
-            logits = outputs.logits[:, -1, :]
-            current_position += len(block_user_tokens)
-
-            for _ in range(self.y_ratio):
-                apply_penalty = self._should_apply_silence_penalty(assistant_count, epad_count, max_epad_count)
-                token_id = self._sample_token(
-                    logits,
-                    temperature=temperature,
-                    top_p=top_p,
-                    mode="text",
-                    silence_penalty=silence_penalty if apply_penalty else 0.0,
-                )
-                text_tokens.append(token_id)
-
-                if token_id == self.assistant_token_id:
-                    assistant_count += 1
-                elif token_id == self.epad_token_id:
-                    epad_count += 1
-                    if epad_count >= max_epad_count:
-                        stop_after_block = True
-                elif self.end_token_id is not None and token_id == self.end_token_id:
-                    stop_after_block = True
-
-                current_input = torch.tensor([[token_id]], device=self.device)
-                position_ids = torch.tensor([[current_position]], device=self.device)
-                outputs = self.model(
-                    input_ids=current_input,
-                    position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                )
-                past_key_values = outputs.past_key_values
-                logits = outputs.logits[:, -1, :]
-                current_position += 1
-
-            for _ in range(self.z_ratio):
-                token_id = self._sample_token(logits, temperature=temperature, top_p=top_p, mode="audio")
-                audio_tokens.append(token_id - self.audio_token_start)
-
-                current_input = torch.tensor([[token_id]], device=self.device)
-                position_ids = torch.tensor([[current_position]], device=self.device)
-                outputs = self.model(
-                    input_ids=current_input,
-                    position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                )
-                past_key_values = outputs.past_key_values
-                logits = outputs.logits[:, -1, :]
-                current_position += 1
-
-            if stop_after_block:
-                break
-
-        total_blocks = block_idx + 1 if block_idx >= 0 else 0
+        total_blocks = state.completed_blocks
         processed_user_tokens = user_audio_tokens[: total_blocks * self.x_ratio]
-        segments = self._extract_segments(text_tokens, audio_tokens, user_audio_duration)
+        segments = self._extract_segments(state.text_tokens, state.audio_tokens, user_audio_duration)
         first_segment = segments[0] if segments else None
         response_audio_tokens = first_segment.audio_tokens if first_segment else []
-        text = first_segment.text if first_segment else self._decode_text(text_tokens)
+        text = first_segment.text if first_segment else self._decode_text(state.text_tokens)
 
         return DuplexResult(
             text=text,
-            text_tokens=text_tokens,
-            audio_tokens=audio_tokens,
+            text_tokens=state.text_tokens,
+            audio_tokens=state.audio_tokens,
             user_audio_tokens=processed_user_tokens,
             response_audio_tokens=response_audio_tokens,
             segments=segments,
             total_blocks=total_blocks,
-            found_assistant=assistant_count > 0,
-            found_epad=epad_count > 0,
-            reached_max_blocks=total_blocks >= max_blocks and not stop_after_block,
+            found_assistant=state.assistant_count > 0,
+            found_epad=state.epad_count > 0,
+            reached_max_blocks=total_blocks >= max_blocks and not state.stop_requested,
             user_audio_duration=user_audio_duration,
             interleave_ratio=self.interleave_ratio,
         )
@@ -488,7 +598,7 @@ class BayLingDuplex:
         self,
         audio: AudioInput,
         max_duration: float = 60.0,
-        temperature: float = 0.6,
+        temperature: float = 0.8,
         top_p: float = 0.8,
         silence_penalty: float = 0.0,
         max_epad_count: int = 1,
@@ -585,6 +695,34 @@ class BayLingDuplex:
         )
         return speech.cpu()
 
+    @torch.no_grad()
+    def stream_tokens_to_audio(
+        self,
+        audio_tokens: Sequence[int],
+        stream_id: str,
+        finalize: bool = False,
+    ) -> torch.Tensor:
+        if self.decoder is None:
+            raise RuntimeError("Audio decoder is not loaded. Pass decoder_path when constructing the model.")
+
+        tokens = torch.tensor(list(audio_tokens), dtype=torch.int64, device=self.device).unsqueeze(0)
+        prompt_token_tensor = torch.zeros(1, 0, dtype=torch.int64, device=self.device)
+        prompt_features = torch.zeros(1, 0, 80, device=self.device)
+
+        if tokens.shape[1] == 0 and not finalize:
+            return torch.zeros(1, 0)
+        if tokens.shape[1] == 0:
+            return torch.zeros(1, 0)
+
+        speech, _ = self.decoder.token2wav(
+            tokens,
+            uuid=stream_id,
+            prompt_token=prompt_token_tensor,
+            prompt_feat=prompt_features,
+            finalize=finalize,
+        )
+        return speech.cpu()
+
     def save_audio(
         self,
         audio_tokens: Sequence[int],
@@ -594,4 +732,4 @@ class BayLingDuplex:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         waveform = self.tokens_to_audio(audio_tokens)
-        torchaudio.save(str(path), waveform, sample_rate or self.output_sample_rate, format="wav")
+        sf.write(str(path), waveform.squeeze(0).numpy(), sample_rate or self.output_sample_rate)
