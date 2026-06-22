@@ -20,6 +20,12 @@ BayLing-Duplex represents user speech, assistant text, and assistant speech as a
 
 The text channel carries dialogue-state tokens such as `[SILENCE]`, `<|assistant|>`, `[PAD]`, and `[EPAD]`, so no extra classifier head, VAD, scheduler, or finite-state turn-taking controller is required at inference time.
 
+
+
+https://github.com/user-attachments/assets/4f99649f-b517-4ce2-bdc8-c19d0d258a2a
+
+
+
 ## Highlights
 
 - Native full-duplex speech dialogue: the model can listen while speaking.
