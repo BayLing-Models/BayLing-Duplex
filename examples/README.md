@@ -7,5 +7,5 @@ examples/input.wav
 examples/interruption.wav
 ```
 
-The CLI accepts any audio format supported by `torchaudio`.
+The CLI reads audio with `soundfile`, so it accepts any format supported by libsndfile (for example WAV, FLAC and MP3).
 
