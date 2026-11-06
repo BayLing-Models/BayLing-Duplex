@@ -5,6 +5,7 @@ safetensors
 sentencepiece
 numpy
 scipy
+soundfile
 einops
 omegaconf
 hyperpyyaml
